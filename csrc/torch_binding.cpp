@@ -50,6 +50,7 @@
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/fused_gdn_l2_recurrent_gated_delta_rule_v310/fused_gdn_l2_recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -2190,6 +2191,25 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                   Tensor? num_accepted_tokens, "
         "                                   float scale_value=1.0) -> (Tensor output)");
     ops.impl("npu_recurrent_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_310);
+
+    ops.def(
+        "npu_fused_gdn_l2_recurrent_gated_delta_rule_310(Tensor query, "
+        "                                                Tensor key, "
+        "                                                Tensor value, "
+        "                                                Tensor a_log, "
+        "                                                Tensor a, "
+        "                                                Tensor b, "
+        "                                                Tensor dt_bias, "
+        "                                                Tensor(a!) state, "
+        "                                                Tensor actual_seq_lengths, "
+        "                                                Tensor ssm_state_indices, "
+        "                                                Tensor? num_accepted_tokens=None, "
+        "                                                float scale_value=1.0, "
+        "                                                float softplus_beta=1.0, "
+        "                                                float threshold=20.0, "
+        "                                                float l2_epsilon=1e-6) -> (Tensor output)");
+    ops.impl("npu_fused_gdn_l2_recurrent_gated_delta_rule_310", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_gdn_l2_recurrent_gated_delta_rule_310);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"

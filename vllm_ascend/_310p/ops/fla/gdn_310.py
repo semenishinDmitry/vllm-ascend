@@ -26,6 +26,9 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_310
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
+from vllm_ascend._310p.ops.fla.fused_gdn_l2_recurrent_gated_delta_rule import (
+    npu_fused_gdn_l2_recurrent_gated_delta_rule_310 as _fused_gdn_l2_recurrent_op,
+)
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
@@ -164,6 +167,47 @@ def npu_recurrent_gated_delta_rule_310(
         scale_value=k.shape[-1] ** -0.5,
     ).unsqueeze(0)
     return out
+
+
+def _npu_fused_gdn_l2_recurrent_gated_delta_rule_310(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    total_tokens = v.shape[1]
+    actual_seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32).contiguous()
+    flat_state_indices = _flatten_state_indices(ssm_state_indices, cu_seqlens, total_tokens)
+    flat_state_indices = torch.clamp_min(flat_state_indices, 0).contiguous()
+    accepted_tokens = None
+    if num_accepted_tokens is not None:
+        accepted_tokens = _mask_padded_recurrent_accepted_tokens(
+            num_accepted_tokens,
+            actual_seq_lengths,
+        )
+
+    out = _fused_gdn_l2_recurrent_op(
+        query=q.squeeze(0).to(torch.float16).contiguous(),
+        key=k.squeeze(0).to(torch.float16).contiguous(),
+        value=v.squeeze(0).to(torch.float16).contiguous(),
+        a_log=a_log.to(torch.float32).contiguous(),
+        a=a.squeeze(0).to(torch.float16).contiguous(),
+        b=b.squeeze(0).to(torch.float16).contiguous(),
+        dt_bias=dt_bias.to(torch.float32).contiguous(),
+        state=state,
+        actual_seq_lengths=actual_seq_lengths,
+        ssm_state_indices=flat_state_indices,
+        num_accepted_tokens=accepted_tokens,
+        scale_value=k.shape[-1] ** -0.5,
+    )
+    return out.unsqueeze(0)
 
 
 def _310p_get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
@@ -331,40 +375,51 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
-        g, beta = fused_gdn_gating_pytorch(self.A_log, a, b, self.dt_bias)
+        g = None
+        beta = None
+        if attn_metadata.num_prefills > 0:
+            # Chunk prefill still consumes precomputed gating tensors.
+            g, beta = fused_gdn_gating_pytorch(self.A_log, a, b, self.dt_bias)
         if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
             if spec_sequence_masks is not None:
                 if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                    g_spec = g
-                    beta_spec = beta
+                    a_spec = a.unsqueeze(0)
+                    b_spec = b.unsqueeze(0)
                     g_non_spec = None
                     beta_non_spec = None
+                    a_non_spec = None
+                    b_non_spec = None
                 else:
-                    g_spec = g.index_select(1, spec_token_indx)
-                    beta_spec = beta.index_select(1, spec_token_indx)
-                    g_non_spec = g.index_select(1, non_spec_token_indx)
-                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                    a_spec = a.index_select(0, spec_token_indx).unsqueeze(0)
+                    b_spec = b.index_select(0, spec_token_indx).unsqueeze(0)
+                    g_non_spec = None if g is None else g.index_select(1, non_spec_token_indx)
+                    beta_non_spec = None if beta is None else beta.index_select(1, non_spec_token_indx)
+                    a_non_spec = a.index_select(0, non_spec_token_indx).unsqueeze(0)
+                    b_non_spec = b.index_select(0, non_spec_token_indx).unsqueeze(0)
             else:
-                g_spec = None
-                beta_spec = None
+                a_spec = None
+                b_spec = None
                 g_non_spec = g
                 beta_non_spec = beta
+                a_non_spec = a.unsqueeze(0)
+                b_non_spec = b.unsqueeze(0)
 
             # 2. Recurrent attention
 
             # 2.1: Process the multi-query part
             if spec_sequence_masks is not None:
-                core_attn_out_spec = npu_recurrent_gated_delta_rule_310(
+                core_attn_out_spec = _npu_fused_gdn_l2_recurrent_gated_delta_rule_310(
                     q=query_spec,
                     k=key_spec,
                     v=value_spec,
-                    g=g_spec,
-                    beta=beta_spec,
+                    a_log=self.A_log,
+                    a=a_spec,
+                    b=b_spec,
+                    dt_bias=self.dt_bias,
                     state=ssm_state,
                     cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
                 )
             else:
                 core_attn_out_spec = None
@@ -392,31 +447,33 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 # Init cache
                 ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
             elif attn_metadata.num_decodes > 0:
-                core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
+                core_attn_out_non_spec = _npu_fused_gdn_l2_recurrent_gated_delta_rule_310(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
+                    a_log=self.A_log,
+                    a=a_non_spec,
+                    b=b_non_spec,
+                    dt_bias=self.dt_bias,
                     state=ssm_state,
                     cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
                 )
             else:
                 core_attn_out_non_spec = None
 
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
+            core_attn_out_non_spec = _npu_fused_gdn_l2_recurrent_gated_delta_rule_310(
                 q=query_non_spec,
                 k=key_non_spec,
                 v=value_non_spec,
-                g=g,
-                beta=beta,
+                a_log=self.A_log,
+                a=a.unsqueeze(0),
+                b=b.unsqueeze(0),
+                dt_bias=self.dt_bias,
                 state=ssm_state,
                 cu_seqlens=non_spec_query_start_loc,
                 ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
             )
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:

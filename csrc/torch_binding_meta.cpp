@@ -756,6 +756,40 @@ at::Tensor npu_recurrent_gated_delta_rule_310_meta(
     return output;
 }
 
+at::Tensor npu_fused_gdn_l2_recurrent_gated_delta_rule_310_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& a_log,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& dt_bias,
+    at::Tensor& state,
+    const at::Tensor& actual_seq_lengths,
+    const at::Tensor& ssm_state_indices,
+    const c10::optional<at::Tensor>& num_accepted_tokens,
+    double scale_value,
+    double softplus_beta,
+    double threshold,
+    double l2_epsilon)
+{
+    (void)query;
+    (void)key;
+    (void)a_log;
+    (void)a;
+    (void)b;
+    (void)dt_bias;
+    (void)state;
+    (void)actual_seq_lengths;
+    (void)ssm_state_indices;
+    (void)num_accepted_tokens;
+    (void)scale_value;
+    (void)softplus_beta;
+    (void)threshold;
+    (void)l2_epsilon;
+    return at::empty_symint(value.sym_sizes(), value.options());
+}
+
 at::Tensor npu_recurrent_gated_delta_rule_meta(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -1753,6 +1787,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310
     ops.impl("npu_recurrent_gated_delta_rule_310", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_310_meta);
+    ops.impl("npu_fused_gdn_l2_recurrent_gated_delta_rule_310",
+             &vllm_ascend::meta::npu_fused_gdn_l2_recurrent_gated_delta_rule_310_meta);
     // chunk_gated_delta_rule_fwd_h
     ops.impl("chunk_gated_delta_rule_fwd_h", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_h_meta);
     // chunk_fwd_o
