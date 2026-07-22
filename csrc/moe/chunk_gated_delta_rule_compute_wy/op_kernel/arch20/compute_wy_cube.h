@@ -105,23 +105,32 @@ class WyCubeGemm {
     CopyFloatRowsFromGm(pUb, cGm_, WY_CUBE_CHUNK, WY_CUBE_CHUNK, WY_CUBE_CHUNK);
   }
 
-  // R = R + P @ R for one RHS block (U or W). rLda may be alignN > nDim.
-  // Bulk UB<->GM copies (no per-row sync). halfScratch holds P then R as contiguous half;
-  // floatScratch (>= 64*nDim floats, e.g. tmpBuf_ [64,max(K,V)]) holds C for Add.
-  __aicore__ inline void GemmApplyAdd(LocalTensor<float> rUb, const LocalTensor<float> pUb,
-                                      LocalTensor<half> halfScratch, LocalTensor<float> floatScratch, uint32_t nDim,
-                                      uint32_t rLda, bool useU)
+  // Cast P[64,64] → halfScratch and upload to aGm_. Call once per doubling round
+  // before ApplyAdd U/W. halfScratch must stay live until MTE3 finishes (do not alias
+  // with the R half buffer used by GemmApplyAdd).
+  __aicore__ inline void UploadP(const LocalTensor<float> pUb, LocalTensor<half> halfScratch)
   {
-    // P[64,64] -> A on GM
     Cast(halfScratch, pUb, RoundMode::CAST_NONE, WY_CUBE_CHUNK * WY_CUBE_CHUNK);
     PipeBarrier<PIPE_V>();
     CopyHalfRowsToGm(aGm_, halfScratch, WY_CUBE_CHUNK, WY_CUBE_CHUNK, WY_CUBE_CHUNK);
+    event_t evt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+    SetFlag<HardEvent::MTE3_V>(evt);
+    WaitFlag<HardEvent::MTE3_V>(evt);
+  }
 
-    // R[64,nDim] (possibly strided) -> contiguous half -> B on GM
+  // R = R + P @ R for one RHS block (U or W). Assumes P already on aGm_ (UploadP).
+  // halfScratch: contiguous R half (must NOT be the UploadP buffer).
+  // floatScratch: >= min(64*nDim, scratchElems) — tiled when scratchElems < 64*nDim.
+  __aicore__ inline void GemmApplyAdd(LocalTensor<float> rUb, LocalTensor<half> halfScratch,
+                                      LocalTensor<float> floatScratch, uint32_t scratchElems, uint32_t nDim,
+                                      uint32_t rLda, bool useU)
+  {
     CastFloatRowsToHalfContiguous(halfScratch, rUb, WY_CUBE_CHUNK, nDim, rLda);
     CopyHalfRowsToGm(bGm_, halfScratch, WY_CUBE_CHUNK, nDim, nDim);
     PipeBarrier<PIPE_ALL>();
 
+    // Prefer the apply object whose host tiling matches max(K,V); both are sized
+    // identically now, but keep the branch for clarity / future divergence.
     if (useU) {
       mmApplyU_.SetOrgShape(WY_CUBE_CHUNK, static_cast<int>(nDim), WY_CUBE_CHUNK);
       mmApplyU_.SetSingleShape(WY_CUBE_CHUNK, static_cast<int>(nDim), WY_CUBE_CHUNK);
@@ -139,22 +148,50 @@ class WyCubeGemm {
     }
     PipeBarrier<PIPE_ALL>();
 
-    // C[64,nDim] from GM -> floatScratch, then R += C
-    CopyFloatRowsFromGm(floatScratch, cGm_, WY_CUBE_CHUNK, nDim, nDim);
-    event_t evt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
-    SetFlag<HardEvent::MTE2_V>(evt);
-    WaitFlag<HardEvent::MTE2_V>(evt);
-    if (rLda == nDim) {
-      Add(rUb, rUb, floatScratch, WY_CUBE_CHUNK * nDim);
-    } else {
-      for (uint32_t row = 0; row < WY_CUBE_CHUNK; ++row) {
-        Add(rUb[row * rLda], rUb[row * rLda], floatScratch[row * nDim], nDim);
-      }
-    }
-    PipeBarrier<PIPE_V>();
+    AddCFromGm(rUb, floatScratch, scratchElems, nDim, rLda);
   }
 
  private:
+  __aicore__ inline void AddCFromGm(LocalTensor<float> rUb, LocalTensor<float> floatScratch, uint32_t scratchElems,
+                                    uint32_t nDim, uint32_t rLda) const
+  {
+    const uint32_t total = WY_CUBE_CHUNK * nDim;
+    if (total <= scratchElems) {
+      CopyFloatRowsFromGm(floatScratch, cGm_, WY_CUBE_CHUNK, nDim, nDim);
+      event_t evt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+      SetFlag<HardEvent::MTE2_V>(evt);
+      WaitFlag<HardEvent::MTE2_V>(evt);
+      if (rLda == nDim) {
+        Add(rUb, rUb, floatScratch, total);
+      } else {
+        for (uint32_t row = 0; row < WY_CUBE_CHUNK; ++row) {
+          Add(rUb[row * rLda], rUb[row * rLda], floatScratch[row * nDim], nDim);
+        }
+      }
+      PipeBarrier<PIPE_V>();
+      return;
+    }
+    // scratch holds only T rows of N (e.g. kFloat when V>K).
+    const uint32_t rowsPerTile = scratchElems / nDim;
+    if (rowsPerTile == 0) {
+      return;
+    }
+    for (uint32_t row0 = 0; row0 < WY_CUBE_CHUNK; row0 += rowsPerTile) {
+      const uint32_t rows = (row0 + rowsPerTile > WY_CUBE_CHUNK) ? (WY_CUBE_CHUNK - row0) : rowsPerTile;
+      CopyFloatRowsFromGm(floatScratch, cGm_[row0 * nDim], rows, nDim, nDim);
+      event_t evt = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+      SetFlag<HardEvent::MTE2_V>(evt);
+      WaitFlag<HardEvent::MTE2_V>(evt);
+      if (rLda == nDim) {
+        Add(rUb[row0 * rLda], rUb[row0 * rLda], floatScratch, rows * nDim);
+      } else {
+        for (uint32_t r = 0; r < rows; ++r) {
+          Add(rUb[(row0 + r) * rLda], rUb[(row0 + r) * rLda], floatScratch[r * nDim], nDim);
+        }
+      }
+      PipeBarrier<PIPE_V>();
+    }
+  }
   __aicore__ inline void CastFloatRowsToHalfContiguous(LocalTensor<half> dst, const LocalTensor<float> src,
                                                        uint32_t rows, uint32_t cols, uint32_t srcLda) const
   {
